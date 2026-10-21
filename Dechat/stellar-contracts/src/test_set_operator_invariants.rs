@@ -162,6 +162,23 @@ fn accounting(bridge: &FiatBridgeClient<'_>) -> AccountingFingerprint {
     }
 }
 
+/// Register and initialise a bridge; returns its address, client and admin.
+fn setup_bridge_with_admin(env: &Env) -> (Address, FiatBridgeClient<'_>, Address) {
+    let admin = Address::generate(env);
+    let (token_client, _token_admin) = create_token_contract(env, &admin);
+    let token_address = token_client.address.clone();
+
+    let contract_id = env.register(FiatBridge, ());
+    let client = FiatBridgeClient::new(env, &contract_id);
+
+    let mut signers = Vec::new(env);
+    signers.push_back(admin.clone());
+
+    client.init(&admin, &token_address, &1_000_000, &100, &signers, &1, &0);
+
+    (contract_id, client, admin)
+}
+
 // ── The flag is the truth ────────────────────────────────────────────────
 
 /// An accepted activation sets exactly the target's flag, and deactivation is
@@ -171,7 +188,7 @@ fn activation_and_deactivation_are_exact_inverses() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (contract_id, bridge, _admin) = setup_bridge(&env);
+    let (contract_id, bridge, admin) = setup_bridge_with_admin(&env);
     let operator = Address::generate(&env);
     let bystander = Address::generate(&env);
 
@@ -199,7 +216,7 @@ fn repeated_activation_never_double_counts_the_roster() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (contract_id, bridge, _admin) = setup_bridge(&env);
+    let (contract_id, bridge, admin) = setup_bridge_with_admin(&env);
     let operator = Address::generate(&env);
 
     for nonce in 0u64..4 {
@@ -220,7 +237,7 @@ fn roster_size_tracks_the_number_of_active_operators() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (contract_id, bridge, _admin) = setup_bridge(&env);
+    let (contract_id, bridge, admin) = setup_bridge_with_admin(&env);
     let a = Address::generate(&env);
     let b = Address::generate(&env);
     let c = Address::generate(&env);
@@ -230,18 +247,18 @@ fn roster_size_tracks_the_number_of_active_operators() {
         last_event_u32(&env, &contract_id, "operator_count"),
         Some(1)
     );
-    bridge.set_operator(&b, &true, &0);
+    bridge.set_operator(&b, &true, &1);
     assert_eq!(
         last_event_u32(&env, &contract_id, "operator_count"),
         Some(2)
     );
-    bridge.set_operator(&c, &true, &0);
+    bridge.set_operator(&c, &true, &2);
     assert_eq!(
         last_event_u32(&env, &contract_id, "operator_count"),
         Some(3)
     );
 
-    bridge.set_operator(&b, &false, &1);
+    bridge.set_operator(&b, &false, &3);
     assert_eq!(
         last_event_u32(&env, &contract_id, "operator_count"),
         Some(2)
@@ -261,7 +278,7 @@ fn event_reports_the_full_transition() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (contract_id, bridge, _admin) = setup_bridge(&env);
+    let (contract_id, bridge, admin) = setup_bridge_with_admin(&env);
     let operator = Address::generate(&env);
 
     bridge.set_operator(&operator, &true, &0);
@@ -352,7 +369,7 @@ fn admin_can_never_become_an_operator() {
         Err(Ok(Error::NotAllowed))
     );
     assert!(!bridge.is_operator(&admin));
-    assert_eq!(bridge.get_operator_nonce(&admin), 0);
+    assert_eq!(bridge.get_set_operator_nonce(&admin), 0);
 }
 
 /// The contract can never hold the operator role either.
@@ -368,7 +385,7 @@ fn contract_address_can_never_become_an_operator() {
         Err(Ok(Error::InvalidRecipient))
     );
     assert!(!bridge.is_operator(&contract_id));
-    assert_eq!(bridge.get_operator_nonce(&contract_id), 0);
+    assert_eq!(bridge.get_set_operator_nonce(&contract_id), 0);
 }
 
 /// Deactivating an address that was never an operator is rejected outright
@@ -378,7 +395,7 @@ fn deactivating_a_non_operator_is_rejected_and_writes_nothing() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (_contract_id, bridge, _admin) = setup_bridge(&env);
+    let (_contract_id, bridge, admin) = setup_bridge_with_admin(&env);
     let stranger = Address::generate(&env);
 
     assert_eq!(
@@ -386,7 +403,7 @@ fn deactivating_a_non_operator_is_rejected_and_writes_nothing() {
         Err(Ok(Error::NotOperator))
     );
     assert!(!bridge.is_operator(&stranger));
-    assert_eq!(bridge.get_operator_nonce(&stranger), 0);
+    assert_eq!(bridge.get_set_operator_nonce(&admin), 0);
 }
 
 // ── Cap ──────────────────────────────────────────────────────────────────
@@ -398,7 +415,7 @@ fn roster_never_exceeds_the_configured_cap() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (contract_id, bridge, _admin) = setup_bridge(&env);
+    let (contract_id, bridge, admin) = setup_bridge_with_admin(&env);
     bridge.set_max_operators(&2);
 
     let a = Address::generate(&env);
@@ -406,26 +423,26 @@ fn roster_never_exceeds_the_configured_cap() {
     let c = Address::generate(&env);
 
     bridge.set_operator(&a, &true, &0);
-    bridge.set_operator(&b, &true, &0);
+    bridge.set_operator(&b, &true, &1);
     assert_eq!(
         last_event_u32(&env, &contract_id, "operator_count"),
         Some(2)
     );
 
     assert_eq!(
-        bridge.try_set_operator(&c, &true, &0),
+        bridge.try_set_operator(&c, &true, &2),
         Err(Ok(Error::OperatorCapReached))
     );
     assert!(!bridge.is_operator(&c));
     assert_eq!(
-        bridge.get_operator_nonce(&c),
-        0,
-        "a call rejected by the cap must not burn the operator's nonce"
+        bridge.get_set_operator_nonce(&admin),
+        2,
+        "a call rejected by the cap must not burn the admin's nonce"
     );
 
     // Freeing a slot lets the third operator in, and the roster stays at the cap.
-    bridge.set_operator(&a, &false, &1);
-    bridge.set_operator(&c, &true, &0);
+    bridge.set_operator(&a, &false, &2);
+    bridge.set_operator(&c, &true, &3);
     assert_eq!(
         last_event_u32(&env, &contract_id, "operator_count"),
         Some(2)
@@ -434,22 +451,22 @@ fn roster_never_exceeds_the_configured_cap() {
 
 // ── Nonces ───────────────────────────────────────────────────────────────
 
-/// Each accepted call advances the operator's nonce by exactly one.
+/// Each accepted call advances the admin's set_operator nonce by exactly one.
 #[test]
 fn accepted_calls_advance_the_nonce_by_exactly_one() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (_contract_id, bridge, _admin) = setup_bridge(&env);
+    let (_contract_id, bridge, admin) = setup_bridge_with_admin(&env);
     let operator = Address::generate(&env);
 
-    assert_eq!(bridge.get_operator_nonce(&operator), 0);
+    assert_eq!(bridge.get_set_operator_nonce(&admin), 0);
     bridge.set_operator(&operator, &true, &0);
-    assert_eq!(bridge.get_operator_nonce(&operator), 1);
+    assert_eq!(bridge.get_set_operator_nonce(&admin), 1);
     bridge.set_operator(&operator, &false, &1);
-    assert_eq!(bridge.get_operator_nonce(&operator), 2);
+    assert_eq!(bridge.get_set_operator_nonce(&admin), 2);
     bridge.set_operator(&operator, &true, &2);
-    assert_eq!(bridge.get_operator_nonce(&operator), 3);
+    assert_eq!(bridge.get_set_operator_nonce(&admin), 3);
 }
 
 /// Replaying a consumed nonce, or skipping ahead, is rejected and leaves both
@@ -459,18 +476,18 @@ fn stale_and_future_nonces_are_rejected_without_side_effects() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (_contract_id, bridge, _admin) = setup_bridge(&env);
+    let (_contract_id, bridge, admin) = setup_bridge_with_admin(&env);
     let operator = Address::generate(&env);
 
     bridge.set_operator(&operator, &true, &0);
-    assert_eq!(bridge.get_operator_nonce(&operator), 1);
+    assert_eq!(bridge.get_set_operator_nonce(&admin), 1);
 
     // Replay of the consumed nonce.
     assert_eq!(
         bridge.try_set_operator(&operator, &false, &0),
         Err(Ok(Error::StaleNonce))
     );
-    assert_eq!(bridge.get_operator_nonce(&operator), 1);
+    assert_eq!(bridge.get_set_operator_nonce(&admin), 1);
     assert!(bridge.is_operator(&operator));
 
     // Skipping ahead.
@@ -478,7 +495,7 @@ fn stale_and_future_nonces_are_rejected_without_side_effects() {
         bridge.try_set_operator(&operator, &false, &99),
         Err(Ok(Error::InvalidNonce))
     );
-    assert_eq!(bridge.get_operator_nonce(&operator), 1);
+    assert_eq!(bridge.get_set_operator_nonce(&admin), 1);
     assert!(bridge.is_operator(&operator));
 
     // The correct nonce still works afterwards.
@@ -486,26 +503,26 @@ fn stale_and_future_nonces_are_rejected_without_side_effects() {
     assert!(!bridge.is_operator(&operator));
 }
 
-/// Nonces are per operator: consuming one address's nonce leaves every other
-/// address's counter untouched.
+/// Nonces are per admin: consuming one admin's nonce leaves every other
+/// admin's counter untouched.
 #[test]
-fn nonces_are_scoped_per_operator() {
+fn nonces_are_scoped_per_admin() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (_contract_id, bridge, _admin) = setup_bridge(&env);
-    let a = Address::generate(&env);
-    let b = Address::generate(&env);
+    let (_contract_id, bridge, admin) = setup_bridge_with_admin(&env);
+    let operator = Address::generate(&env);
 
-    bridge.set_operator(&a, &true, &0);
-    bridge.set_operator(&a, &false, &1);
+    bridge.set_operator(&operator, &true, &0);
+    bridge.set_operator(&operator, &false, &1);
 
-    assert_eq!(bridge.get_operator_nonce(&a), 2);
-    assert_eq!(bridge.get_operator_nonce(&b), 0);
+    assert_eq!(bridge.get_set_operator_nonce(&admin), 2);
+    assert_eq!(bridge.get_operator_nonce(&operator), 0);
 
-    bridge.set_operator(&b, &true, &0);
-    assert_eq!(bridge.get_operator_nonce(&a), 2);
-    assert_eq!(bridge.get_operator_nonce(&b), 1);
+    // Operator's heartbeat nonce is separate from admin's set_operator nonce
+    bridge.heartbeat(&operator, &0);
+    assert_eq!(bridge.get_set_operator_nonce(&admin), 2);
+    assert_eq!(bridge.get_operator_nonce(&operator), 1);
 }
 
 // ── Authorisation and uninitialised state ────────────────────────────────
@@ -571,7 +588,7 @@ fn accounting_is_untouched_by_accepted_and_rejected_calls() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (_contract_id, bridge, admin) = setup_bridge(&env);
+    let (_contract_id, bridge, admin) = setup_bridge_with_admin(&env);
     let operator = Address::generate(&env);
 
     let before = accounting(&bridge);
@@ -579,8 +596,8 @@ fn accounting_is_untouched_by_accepted_and_rejected_calls() {
     bridge.set_operator(&operator, &true, &0);
     assert_eq!(before, accounting(&bridge));
 
-    let _ = bridge.try_set_operator(&admin, &true, &0);
-    let _ = bridge.try_set_operator(&operator, &true, &99);
+    let _ = bridge.try_set_operator(&admin, &true, &1);
+    let _ = bridge.try_set_operator(&operator, &true, &2);
     assert_eq!(before, accounting(&bridge));
 
     bridge.set_operator(&operator, &false, &1);
