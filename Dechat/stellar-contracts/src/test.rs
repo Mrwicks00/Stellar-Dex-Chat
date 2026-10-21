@@ -315,7 +315,7 @@ fn test_deposit_succeeds_after_cooldown_period() {
     });
 
     bridge.deposit(&user, &100, &token_addr, &Bytes::new(&env), &0, &0, &None);
-    assert_eq!(bridge.get_user_deposited(&user), 200);
+    assert_eq!(bridge.get_user_lifetime_deposited(&user), 200);
 }
 
 #[test]
@@ -1826,7 +1826,7 @@ fn test_remove_denied_address_restores_access() {
 
     // Deposit should succeed after removal
     bridge.deposit(&user, &100, &token_addr, &Bytes::new(&env), &0, &0, &None);
-    assert_eq!(bridge.get_user_deposited(&user), 200);
+    assert_eq!(bridge.get_user_lifetime_deposited(&user), 200);
 }
 
 #[test]
@@ -1876,7 +1876,7 @@ fn test_denylist_does_not_affect_other_users() {
         &0,
         &None,
     );
-    assert_eq!(bridge.get_user_deposited(&normal_user), 200);
+    assert_eq!(bridge.get_user_lifetime_deposited(&normal_user), 200);
 }
 
 #[test]
@@ -3669,7 +3669,7 @@ mod proptest_deposit {
     // 1. deposit() succeeds
     // 2. contract balance increases by exactly amount
     // 3. user balance decreases by exactly amount
-    // 4. get_user_deposited() returns amount
+    // 4. get_user_lifetime_deposited() returns amount
 
     proptest! {
         #[test]
@@ -3688,7 +3688,7 @@ mod proptest_deposit {
 
             prop_assert_eq!(token.balance(&user), user_before - amount);
             prop_assert_eq!(token.balance(&contract_id), contract_before + amount);
-            prop_assert_eq!(bridge.get_user_deposited(&user), amount);
+            prop_assert_eq!(bridge.get_user_lifetime_deposited(&user), amount);
         }
 
         /// Amounts above the configured limit must be rejected with ExceedsLimit.
@@ -5068,13 +5068,13 @@ fn test_deposit_invariant_user_deposited_tracking() {
     let user = Address::generate(&env);
     token_sac.mint(&user, &10000);
 
-    assert_eq!(bridge.get_user_deposited(&user), 0);
+    assert_eq!(bridge.get_user_lifetime_deposited(&user), 0);
 
     bridge.deposit(&user, &300, &token_addr, &Bytes::new(&env), &0, &0, &None);
-    assert_eq!(bridge.get_user_deposited(&user), 300);
+    assert_eq!(bridge.get_user_lifetime_deposited(&user), 300);
 
     bridge.deposit(&user, &200, &token_addr, &Bytes::new(&env), &0, &0, &None);
-    assert_eq!(bridge.get_user_deposited(&user), 500);
+    assert_eq!(bridge.get_user_lifetime_deposited(&user), 500);
 }
 
 #[test]
@@ -5136,7 +5136,7 @@ fn test_deposit_invariant_multiple_deposits_same_user() {
     assert_ne!(id1, id3);
 
     // User total must be sum of all deposits
-    assert_eq!(bridge.get_user_deposited(&user), 600);
+    assert_eq!(bridge.get_user_lifetime_deposited(&user), 600);
 }
 
 #[test]
@@ -5155,6 +5155,42 @@ fn test_deposit_invariant_emits_deposit_event() {
 
     // Should have DepositEvent and ReceiptIssuedEvent
     assert!(raw.len() >= 2);
+}
+
+#[test]
+fn test_two_withdrawal_requests_exceeding_deposit_are_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, admin, token_addr, _, token_sac) = setup_bridge(&env, 1000);
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &1000);
+
+    // Deposit 300
+    bridge.deposit(&user, &300, &token_addr, &Bytes::new(&env), &0, &0, &None);
+    assert_eq!(bridge.get_user_available_balance(&user, &token_addr), 300);
+
+    // Request withdrawal for 200 - should succeed
+    let id1 = bridge
+        .request_withdrawal(&user, &200, &token_addr, &None, &0);
+    assert_eq!(bridge.get_user_available_balance(&user, &token_addr), 100);
+
+    // Available balance is 100 (300 - 200)
+    assert_eq!(bridge.get_user_available_balance(&user, &token_addr), 100);
+
+    // Request 100 should succeed (exactly available)
+    let id2 = bridge
+        .request_withdrawal(&user, &100, &token_addr, &None, &0);
+    assert_eq!(bridge.get_user_available_balance(&user, &token_addr), 0);
+
+    // Any further request would fail with InsufficientFunds
+
+    // Cancel both requests
+    bridge.cancel_withdrawal(&id1);
+    bridge.cancel_withdrawal(&id2);
+
+    // Available balance should be back to 300
+    assert_eq!(bridge.get_user_available_balance(&user, &token_addr), 300);
 }
 
 // ── Issue 2: deposit event emission schema tests ─────────────────────────

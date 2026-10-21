@@ -241,7 +241,7 @@ fn deposit_rejected_while_denied_and_allowed_after_removal() {
         ),
         Err(Ok(Error::AddressDenied))
     );
-    assert_eq!(fx.bridge.get_user_deposited(&user), 0);
+    assert_eq!(fx.bridge.get_user_lifetime_deposited(&user), 0);
 
     fx.bridge.remove_denied_address(&user);
     fx.bridge.deposit(
@@ -253,7 +253,7 @@ fn deposit_rejected_while_denied_and_allowed_after_removal() {
         &0,
         &None,
     );
-    assert_eq!(fx.bridge.get_user_deposited(&user), 100);
+    assert_eq!(fx.bridge.get_user_lifetime_deposited(&user), 100);
 }
 
 #[test]
@@ -337,7 +337,7 @@ fn denying_one_address_does_not_block_another() {
         &0,
         &None,
     );
-    assert_eq!(fx.bridge.get_user_deposited(&bystander), 100);
+    assert_eq!(fx.bridge.get_user_lifetime_deposited(&bystander), 100);
 }
 
 // ── Events ───────────────────────────────────────────────────────────────

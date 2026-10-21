@@ -265,22 +265,12 @@ fn approval_after_execution_is_rejected_and_leaves_no_state_change() {
 
     bridge.execute_multisig_action(&id);
 
-    let before = bridge.get_multisig_proposal(&id).unwrap();
-    assert!(before.executed, "proposal should be marked executed");
+    // After execution, the proposal is deleted
+    assert!(bridge.get_multisig_proposal(&id).is_none());
 
     let latecomer = signers.get(1).unwrap();
     let result = bridge.try_approve_multisig_action(&latecomer, &id);
-    assert_eq!(result, Err(Ok(Error::ProposalAlreadyExecuted)));
-
-    let after = bridge.get_multisig_proposal(&id).unwrap();
-    assert_eq!(
-        before, after,
-        "approving an executed proposal must not mutate it"
-    );
-    assert!(
-        !after.approvals.contains(&latecomer),
-        "a late approver must not be recorded"
-    );
+    assert_eq!(result, Err(Ok(Error::ProposalNotFound)));
 }
 
 // ── Cross-proposal isolation ─────────────────────────────────────────────────
@@ -405,4 +395,21 @@ proptest! {
         let after = bridge.get_multisig_proposal(&id).unwrap();
         prop_assert_eq!(before, after);
     }
+}
+
+#[test]
+fn approve_before_init_returns_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract_id = env.register(FiatBridge, ());
+    let bridge = FiatBridgeClient::new(&env, &contract_id);
+    let signer = Address::generate(&env);
+
+    let result = bridge.try_approve_multisig_action(&signer, &0);
+    assert_eq!(result, Err(Ok(Error::NotInitialized)));
 }
