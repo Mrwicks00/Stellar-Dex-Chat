@@ -17,6 +17,10 @@ const WINDOW_LEDGERS: u32 = 17_280; // ~24 hours
 const CIRCUIT_BREAKER_RESET_LEDGERS: u32 = 34_560; // ~48 hours (2 × WINDOW_LEDGERS)
 const WITHDRAWAL_EXPIRY_WINDOW_LEDGERS: u32 = 17_280; // ~24 hours — reserved for future withdrawal expiry feature
 const MIN_TIMELOCK_DELAY: u32 = 34_560; // 48 hours
+/// Number of ledgers a multisig proposal is valid before it expires.
+/// Stellar closes roughly 1 ledger every ~5–6 seconds (≈17 280 ledgers/day).
+/// At that rate 518 400 ledgers ≈ 30 days.
+const MULTISIG_PROPOSAL_EXPIRY: u32 = 518_400; // ~30 days
 /// Number of ledgers an operator may go without a heartbeat before being
 /// eligible for pruning by `prune_inactive_operators`.
 ///
@@ -139,6 +143,7 @@ pub enum Error {
     ProposalAlreadyExecuted = 1206,
     ThresholdNotMet = 1207,
     MaxSignersReached = 1208,
+    ProposalExpired = 1209,
 }
 
 // ── Models ────────────────────────────────────────────────────────────────
@@ -850,6 +855,21 @@ pub enum DataKey {
     WithdrawalExpiryWindow,
     LastLargeDeposit(Address),
     UserDeposited(Address),
+    /// Per-user, per-token available balance (deposited minus reserved withdrawals).
+    /// This tracks the actual funds available for withdrawal requests, unlike
+    /// UserDeposited which is a lifetime total across all tokens.
+    ///
+    /// STORAGE MIGRATION NOTE:
+    /// When upgrading from a version without this key, existing UserDeposited values
+    /// represent lifetime totals across all tokens and cannot be directly migrated to
+    /// per-token available balances. A migration script should:
+    /// 1. Read all existing UserDeposited(user) values
+    /// 2. For each user, determine their actual available balance per token by
+    ///    checking TokenRegistry.total_deposited minus their executed withdrawals
+    /// 3. Write UserAvailableBalance(user, token) for each token they have deposits in
+    /// 4. Alternatively, treat existing deposits as fully available and set
+    ///    UserAvailableBalance to the UserDeposited value for the default token only
+    UserAvailableBalance(Address, Address),
     NextActionID,
     QueuedAdminAction(u64),
     LastAdminActionLedger,
@@ -1346,6 +1366,12 @@ impl FiatBridge {
         let new_user_total = user_total.checked_add(amount).ok_or(Error::InternalError)?;
         env.storage().instance().set(&user_key, &new_user_total);
 
+        // Track per-user, per-token available balance
+        let balance_key = DataKey::UserAvailableBalance(from.clone(), token.clone());
+        let user_balance: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        let new_user_balance = user_balance.checked_add(amount).ok_or(Error::InternalError)?;
+        env.storage().instance().set(&balance_key, &new_user_balance);
+
         // Track large deposits for withdrawal cooldown
         let withdraw_threshold: i128 = env
             .storage()
@@ -1697,12 +1723,18 @@ impl FiatBridge {
             .get(&DataKey::TokenRegistry(token.clone()))
             .ok_or(Error::TokenNotWhitelisted)?;
 
+        // Check per-user, per-token available balance
+        let balance_key = DataKey::UserAvailableBalance(to.clone(), token.clone());
+        let user_available: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        if amount > user_available {
+            return Err(Error::InsufficientFunds);
+        }
+
+        // Reserve the amount from user's available balance
+        let new_user_balance = user_available.checked_sub(amount).ok_or(Error::InternalError)?;
+        env.storage().instance().set(&balance_key, &new_user_balance);
+
         // Verify the new liabilities don't exceed net deposited
-        let user_deposited: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::UserDeposited(to.clone()))
-            .unwrap_or(0);
         let new_liabilities = config
             .total_liabilities
             .checked_add(amount)
@@ -1710,7 +1742,7 @@ impl FiatBridge {
         let net_deposited = config
             .total_deposited
             .saturating_sub(config.total_withdrawn);
-        if new_liabilities > net_deposited || amount > user_deposited {
+        if new_liabilities > net_deposited {
             return Err(Error::InsufficientFunds);
         }
 
@@ -1869,6 +1901,13 @@ impl FiatBridge {
         if execute_amount == request.amount {
             Self::remove_from_withdraw_queue(&env, request_id, &request);
         } else {
+            // Release the unexecuted portion back to user's available balance
+            let remaining = request.amount - execute_amount;
+            let balance_key = DataKey::UserAvailableBalance(request.to.clone(), request.token.clone());
+            let user_balance: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+            let new_user_balance = user_balance.checked_add(remaining).ok_or(Error::InternalError)?;
+            env.storage().instance().set(&balance_key, &new_user_balance);
+
             request.amount -= execute_amount;
             env.storage()
                 .persistent()
@@ -1935,6 +1974,12 @@ impl FiatBridge {
             .get(&DataKey::WithdrawQueue(request_id))
             .ok_or(Error::RequestNotFound)?;
 
+        // Release the reserved amount back to user's available balance
+        let balance_key = DataKey::UserAvailableBalance(request.to.clone(), request.token.clone());
+        let user_balance: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        let new_user_balance = user_balance.checked_add(request.amount).ok_or(Error::InternalError)?;
+        env.storage().instance().set(&balance_key, &new_user_balance);
+
         Self::release_liability(&env, &request.token, request.amount)?;
         Self::remove_from_withdraw_queue(&env, request_id, &request);
 
@@ -1979,6 +2024,12 @@ impl FiatBridge {
         if env.ledger().sequence() <= request.queued_ledger.saturating_add(expiry_window) {
             return Err(Error::WithdrawalLocked);
         }
+
+        // Release the reserved amount back to user's available balance
+        let balance_key = DataKey::UserAvailableBalance(request.to.clone(), request.token.clone());
+        let user_balance: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        let new_user_balance = user_balance.checked_add(request.amount).ok_or(Error::InternalError)?;
+        env.storage().instance().set(&balance_key, &new_user_balance);
 
         Self::release_liability(&env, &request.token, request.amount)?;
         Self::remove_from_withdraw_queue(&env, request_id, &request);
@@ -3807,11 +3858,32 @@ impl FiatBridge {
             .limit)
     }
 
-    pub fn get_user_deposited(env: Env, user: Address) -> i128 {
+    /// Returns the lifetime total deposits for a user across all tokens.
+    /// This is a historical aggregate and does not reflect available balance.
+    /// Use `get_user_available_balance` for the actual withdrawable amount per token.
+    pub fn get_user_lifetime_deposited(env: Env, user: Address) -> i128 {
         env.storage()
             .instance()
             .get(&DataKey::UserDeposited(user))
             .unwrap_or(0)
+    }
+
+    /// Returns the available balance for a user for a specific token.
+    /// This is the amount that can be requested for withdrawal, accounting for
+    /// all pending withdrawal requests.
+    pub fn get_user_available_balance(env: Env, user: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::UserAvailableBalance(user, token))
+            .unwrap_or(0)
+    }
+
+    /// Deprecated: use `get_user_lifetime_deposited` for clarity.
+    /// This method is kept for backward compatibility but returns the lifetime
+    /// total, not the available balance.
+    #[deprecated(note = "use get_user_lifetime_deposited for clarity")]
+    pub fn get_user_deposited(env: Env, user: Address) -> i128 {
+        Self::get_user_lifetime_deposited(env, user)
     }
 
     pub fn get_daily_deposit_record(env: Env, user: Address) -> Option<UserDailyVolume> {
@@ -5348,7 +5420,11 @@ impl FiatBridge {
     ) -> Result<u64, Error> {
         proposer.require_auth();
 
-        let signers: Vec<Address> = env.storage().instance().get(&DataKey::Signers).unwrap();
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Signers)
+            .ok_or(Error::NotInitialized)?;
         if !signers.contains(&proposer) {
             return Err(Error::Unauthorized);
         }
@@ -5357,10 +5433,11 @@ impl FiatBridge {
             .storage()
             .instance()
             .get(&DataKey::NextMultisigID)
-            .unwrap();
+            .ok_or(Error::NotInitialized)?;
+        let next_id = id.checked_add(1).ok_or(Error::Overflow)?;
         env.storage()
             .instance()
-            .set(&DataKey::NextMultisigID, &(id + 1));
+            .set(&DataKey::NextMultisigID, &next_id);
 
         let mut approvals = Vec::<Address>::new(&env);
         approvals.push_back(proposer.clone());
@@ -5373,9 +5450,13 @@ impl FiatBridge {
             created_at: env.ledger().sequence(),
         };
 
+        let proposal_key = DataKey::MultisigProposal(id);
         env.storage()
-            .instance()
-            .set(&DataKey::MultisigProposal(id), &proposal);
+            .persistent()
+            .set(&proposal_key, &proposal);
+        env.storage()
+            .persistent()
+            .extend_ttl(&proposal_key, MIN_TTL, MIN_TTL);
 
         MultisigProposedEvent {
             version: EVENT_VERSION,
@@ -5390,19 +5471,33 @@ impl FiatBridge {
     pub fn approve_multisig_action(env: Env, signer: Address, id: u64) -> Result<(), Error> {
         signer.require_auth();
 
-        let signers: Vec<Address> = env.storage().instance().get(&DataKey::Signers).unwrap();
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Signers)
+            .ok_or(Error::NotInitialized)?;
         if !signers.contains(&signer) {
             return Err(Error::Unauthorized);
         }
 
+        let proposal_key = DataKey::MultisigProposal(id);
         let mut proposal: MultisigProposal = env
             .storage()
-            .instance()
-            .get(&DataKey::MultisigProposal(id))
+            .persistent()
+            .get(&proposal_key)
             .ok_or(Error::ProposalNotFound)?;
 
         if proposal.executed {
             return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        // Check expiry
+        let current_ledger = env.ledger().sequence();
+        if current_ledger
+            .checked_sub(proposal.created_at)
+            .map_or(true, |age| age > MULTISIG_PROPOSAL_EXPIRY)
+        {
+            return Err(Error::ProposalExpired);
         }
 
         if proposal.approvals.contains(&signer) {
@@ -5411,8 +5506,11 @@ impl FiatBridge {
 
         proposal.approvals.push_back(signer.clone());
         env.storage()
-            .instance()
-            .set(&DataKey::MultisigProposal(id), &proposal);
+            .persistent()
+            .set(&proposal_key, &proposal);
+        env.storage()
+            .persistent()
+            .extend_ttl(&proposal_key, MIN_TTL, MIN_TTL);
 
         MultisigApprovedEvent {
             version: EVENT_VERSION,
@@ -5427,14 +5525,24 @@ impl FiatBridge {
     pub fn revoke_multisig_approval(env: Env, signer: Address, id: u64) -> Result<(), Error> {
         signer.require_auth();
 
+        let proposal_key = DataKey::MultisigProposal(id);
         let mut proposal: MultisigProposal = env
             .storage()
-            .instance()
-            .get(&DataKey::MultisigProposal(id))
+            .persistent()
+            .get(&proposal_key)
             .ok_or(Error::ProposalNotFound)?;
 
         if proposal.executed {
             return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        // Check expiry
+        let current_ledger = env.ledger().sequence();
+        if current_ledger
+            .checked_sub(proposal.created_at)
+            .map_or(true, |age| age > MULTISIG_PROPOSAL_EXPIRY)
+        {
+            return Err(Error::ProposalExpired);
         }
 
         let mut index = None;
@@ -5449,8 +5557,11 @@ impl FiatBridge {
             Some(i) => {
                 proposal.approvals.remove(i);
                 env.storage()
-                    .instance()
-                    .set(&DataKey::MultisigProposal(id), &proposal);
+                    .persistent()
+                    .set(&proposal_key, &proposal);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&proposal_key, MIN_TTL, MIN_TTL);
                 MultisigRevokedEvent {
                     version: EVENT_VERSION,
                     id,
@@ -5464,17 +5575,31 @@ impl FiatBridge {
     }
 
     pub fn execute_multisig_action(env: Env, id: u64) -> Result<(), Error> {
-        let mut proposal: MultisigProposal = env
+        let proposal_key = DataKey::MultisigProposal(id);
+        let proposal: MultisigProposal = env
             .storage()
-            .instance()
-            .get(&DataKey::MultisigProposal(id))
+            .persistent()
+            .get(&proposal_key)
             .ok_or(Error::ProposalNotFound)?;
 
         if proposal.executed {
             return Err(Error::ProposalAlreadyExecuted);
         }
 
-        let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
+        // Check expiry
+        let current_ledger = env.ledger().sequence();
+        if current_ledger
+            .checked_sub(proposal.created_at)
+            .map_or(true, |age| age > MULTISIG_PROPOSAL_EXPIRY)
+        {
+            return Err(Error::ProposalExpired);
+        }
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .ok_or(Error::NotInitialized)?;
         if proposal.approvals.len() < threshold {
             return Err(Error::ThresholdNotMet);
         }
@@ -5482,10 +5607,8 @@ impl FiatBridge {
         // Execute the action
         Self::execute_single_admin_op(&env, &proposal.action)?;
 
-        proposal.executed = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::MultisigProposal(id), &proposal);
+        // Delete the proposal after successful execution
+        env.storage().persistent().remove(&proposal_key);
 
         MultisigExecutedEvent {
             version: EVENT_VERSION,
@@ -5497,7 +5620,9 @@ impl FiatBridge {
     }
 
     pub fn get_multisig_proposal(env: Env, id: u64) -> Option<MultisigProposal> {
-        env.storage().instance().get(&DataKey::MultisigProposal(id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::MultisigProposal(id))
     }
 
     pub fn get_multisig_signers(env: Env) -> Vec<Address> {
