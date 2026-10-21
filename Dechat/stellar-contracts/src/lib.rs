@@ -853,6 +853,17 @@ pub enum DataKey {
     /// Per-user, per-token available balance (deposited minus reserved withdrawals).
     /// This tracks the actual funds available for withdrawal requests, unlike
     /// UserDeposited which is a lifetime total across all tokens.
+    ///
+    /// STORAGE MIGRATION NOTE:
+    /// When upgrading from a version without this key, existing UserDeposited values
+    /// represent lifetime totals across all tokens and cannot be directly migrated to
+    /// per-token available balances. A migration script should:
+    /// 1. Read all existing UserDeposited(user) values
+    /// 2. For each user, determine their actual available balance per token by
+    ///    checking TokenRegistry.total_deposited minus their executed withdrawals
+    /// 3. Write UserAvailableBalance(user, token) for each token they have deposits in
+    /// 4. Alternatively, treat existing deposits as fully available and set
+    ///    UserAvailableBalance to the UserDeposited value for the default token only
     UserAvailableBalance(Address, Address),
     NextActionID,
     QueuedAdminAction(u64),
