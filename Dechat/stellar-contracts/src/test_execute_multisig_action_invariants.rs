@@ -79,9 +79,9 @@ fn unknown_op(env: &Env) -> BatchAdminOp {
 }
 
 /// Happy path: once the threshold is met the action applies exactly once and
-/// the proposal is marked executed.
+/// the proposal is deleted.
 #[test]
-fn execution_applies_the_action_and_sets_executed_once() {
+fn execution_applies_the_action_and_deletes_proposal() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -98,8 +98,8 @@ fn execution_applies_the_action_and_sets_executed_once() {
     client.execute_multisig_action(&id);
 
     assert_eq!(client.get_cooldown(), target);
-    let proposal = client.get_multisig_proposal(&id).unwrap();
-    assert!(proposal.executed);
+    // After execution, the proposal is deleted
+    assert!(client.get_multisig_proposal(&id).is_none());
 }
 
 /// The executed flag is single-shot: a second execution is rejected and the
@@ -125,12 +125,13 @@ fn double_execution_is_rejected_and_action_is_not_reapplied() {
     client.execute_multisig_action(&id2);
     assert_eq!(client.get_cooldown(), 11);
 
+    // After execution, the proposal is deleted, so a replay is rejected
     let replay = client.try_execute_multisig_action(&id);
-    assert_eq!(replay, Err(Ok(Error::ProposalAlreadyExecuted)));
+    assert_eq!(replay, Err(Ok(Error::ProposalNotFound)));
 
     // The replay did not re-apply the first proposal.
     assert_eq!(client.get_cooldown(), 11);
-    assert!(client.get_multisig_proposal(&id).unwrap().executed);
+    assert!(client.get_multisig_proposal(&id).is_none());
 }
 
 /// Below the threshold execution must fail, and must leave both the proposal
@@ -371,4 +372,70 @@ proptest! {
         prop_assert_eq!(result, Err(Ok(Error::ProposalNotFound)));
         prop_assert_eq!(client.get_cooldown(), cooldown_before);
     }
+}
+
+/// After execution, the proposal is deleted and cannot be read.
+#[test]
+fn executed_proposal_is_deleted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, signers) = setup_bridge_with_signers(&env, 3, 2);
+    let proposer = signers.get(0).unwrap();
+    let second = signers.get(1).unwrap();
+
+    let id = client.propose_multisig_action(&proposer, &set_cooldown_op(&env, 42));
+    client.approve_multisig_action(&second, &id);
+
+    // Verify proposal exists before execution
+    assert!(client.get_multisig_proposal(&id).is_some());
+
+    client.execute_multisig_action(&id);
+
+    // After execution, the proposal should be deleted
+    assert!(client.get_multisig_proposal(&id).is_none());
+}
+
+/// Expired proposals cannot be approved, revoked, or executed.
+#[test]
+fn expired_proposal_cannot_be_approved_revoked_or_executed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, signers) = setup_bridge_with_signers(&env, 3, 2);
+    let proposer = signers.get(0).unwrap();
+    let second = signers.get(1).unwrap();
+
+    let id = client.propose_multisig_action(&proposer, &set_cooldown_op(&env, 42));
+
+    // Jump past the expiry window (518,400 ledgers)
+    env.ledger().set(518_500, 1, 1);
+
+    // Attempting to approve an expired proposal should fail
+    let approve_result = client.try_approve_multisig_action(&second, &id);
+    assert_eq!(approve_result, Err(Ok(Error::ProposalExpired)));
+
+    // Attempting to revoke an expired proposal should also fail
+    let revoke_result = client.try_revoke_multisig_approval(&proposer, &id);
+    assert_eq!(revoke_result, Err(Ok(Error::ProposalExpired)));
+
+    // Attempting to execute an expired proposal should also fail
+    let execute_result = client.try_execute_multisig_action(&id);
+    assert_eq!(execute_result, Err(Ok(Error::ProposalExpired)));
+}
+
+#[test]
+fn execute_before_init_returns_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract_id = env.register(FiatBridge, ());
+    let client = FiatBridgeClient::new(&env, &contract_id);
+
+    let result = client.try_execute_multisig_action(&0);
+    assert_eq!(result, Err(Ok(Error::NotInitialized)));
 }
