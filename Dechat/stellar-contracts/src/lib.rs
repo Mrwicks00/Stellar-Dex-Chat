@@ -17,6 +17,10 @@ const WINDOW_LEDGERS: u32 = 17_280; // ~24 hours
 const CIRCUIT_BREAKER_RESET_LEDGERS: u32 = 34_560; // ~48 hours (2 × WINDOW_LEDGERS)
 const WITHDRAWAL_EXPIRY_WINDOW_LEDGERS: u32 = 17_280; // ~24 hours — reserved for future withdrawal expiry feature
 const MIN_TIMELOCK_DELAY: u32 = 34_560; // 48 hours
+/// Number of ledgers a multisig proposal is valid before it expires.
+/// Stellar closes roughly 1 ledger every ~5–6 seconds (≈17 280 ledgers/day).
+/// At that rate 518 400 ledgers ≈ 30 days.
+const MULTISIG_PROPOSAL_EXPIRY: u32 = 518_400; // ~30 days
 /// Number of ledgers an operator may go without a heartbeat before being
 /// eligible for pruning by `prune_inactive_operators`.
 ///
@@ -139,6 +143,7 @@ pub enum Error {
     ProposalAlreadyExecuted = 1206,
     ThresholdNotMet = 1207,
     MaxSignersReached = 1208,
+    ProposalExpired = 1209,
 }
 
 // ── Models ────────────────────────────────────────────────────────────────
@@ -5405,7 +5410,11 @@ impl FiatBridge {
     ) -> Result<u64, Error> {
         proposer.require_auth();
 
-        let signers: Vec<Address> = env.storage().instance().get(&DataKey::Signers).unwrap();
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Signers)
+            .ok_or(Error::NotInitialized)?;
         if !signers.contains(&proposer) {
             return Err(Error::Unauthorized);
         }
@@ -5414,10 +5423,11 @@ impl FiatBridge {
             .storage()
             .instance()
             .get(&DataKey::NextMultisigID)
-            .unwrap();
+            .ok_or(Error::NotInitialized)?;
+        let next_id = id.checked_add(1).ok_or(Error::Overflow)?;
         env.storage()
             .instance()
-            .set(&DataKey::NextMultisigID, &(id + 1));
+            .set(&DataKey::NextMultisigID, &next_id);
 
         let mut approvals = Vec::<Address>::new(&env);
         approvals.push_back(proposer.clone());
@@ -5430,9 +5440,13 @@ impl FiatBridge {
             created_at: env.ledger().sequence(),
         };
 
+        let proposal_key = DataKey::MultisigProposal(id);
         env.storage()
-            .instance()
-            .set(&DataKey::MultisigProposal(id), &proposal);
+            .persistent()
+            .set(&proposal_key, &proposal);
+        env.storage()
+            .persistent()
+            .extend_ttl(&proposal_key, MIN_TTL, MIN_TTL);
 
         MultisigProposedEvent {
             version: EVENT_VERSION,
@@ -5447,19 +5461,33 @@ impl FiatBridge {
     pub fn approve_multisig_action(env: Env, signer: Address, id: u64) -> Result<(), Error> {
         signer.require_auth();
 
-        let signers: Vec<Address> = env.storage().instance().get(&DataKey::Signers).unwrap();
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Signers)
+            .ok_or(Error::NotInitialized)?;
         if !signers.contains(&signer) {
             return Err(Error::Unauthorized);
         }
 
+        let proposal_key = DataKey::MultisigProposal(id);
         let mut proposal: MultisigProposal = env
             .storage()
-            .instance()
-            .get(&DataKey::MultisigProposal(id))
+            .persistent()
+            .get(&proposal_key)
             .ok_or(Error::ProposalNotFound)?;
 
         if proposal.executed {
             return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        // Check expiry
+        let current_ledger = env.ledger().sequence();
+        if current_ledger
+            .checked_sub(proposal.created_at)
+            .map_or(true, |age| age > MULTISIG_PROPOSAL_EXPIRY)
+        {
+            return Err(Error::ProposalExpired);
         }
 
         if proposal.approvals.contains(&signer) {
@@ -5468,8 +5496,11 @@ impl FiatBridge {
 
         proposal.approvals.push_back(signer.clone());
         env.storage()
-            .instance()
-            .set(&DataKey::MultisigProposal(id), &proposal);
+            .persistent()
+            .set(&proposal_key, &proposal);
+        env.storage()
+            .persistent()
+            .extend_ttl(&proposal_key, MIN_TTL, MIN_TTL);
 
         MultisigApprovedEvent {
             version: EVENT_VERSION,
@@ -5484,14 +5515,24 @@ impl FiatBridge {
     pub fn revoke_multisig_approval(env: Env, signer: Address, id: u64) -> Result<(), Error> {
         signer.require_auth();
 
+        let proposal_key = DataKey::MultisigProposal(id);
         let mut proposal: MultisigProposal = env
             .storage()
-            .instance()
-            .get(&DataKey::MultisigProposal(id))
+            .persistent()
+            .get(&proposal_key)
             .ok_or(Error::ProposalNotFound)?;
 
         if proposal.executed {
             return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        // Check expiry
+        let current_ledger = env.ledger().sequence();
+        if current_ledger
+            .checked_sub(proposal.created_at)
+            .map_or(true, |age| age > MULTISIG_PROPOSAL_EXPIRY)
+        {
+            return Err(Error::ProposalExpired);
         }
 
         let mut index = None;
@@ -5506,8 +5547,11 @@ impl FiatBridge {
             Some(i) => {
                 proposal.approvals.remove(i);
                 env.storage()
-                    .instance()
-                    .set(&DataKey::MultisigProposal(id), &proposal);
+                    .persistent()
+                    .set(&proposal_key, &proposal);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&proposal_key, MIN_TTL, MIN_TTL);
                 MultisigRevokedEvent {
                     version: EVENT_VERSION,
                     id,
@@ -5521,17 +5565,31 @@ impl FiatBridge {
     }
 
     pub fn execute_multisig_action(env: Env, id: u64) -> Result<(), Error> {
-        let mut proposal: MultisigProposal = env
+        let proposal_key = DataKey::MultisigProposal(id);
+        let proposal: MultisigProposal = env
             .storage()
-            .instance()
-            .get(&DataKey::MultisigProposal(id))
+            .persistent()
+            .get(&proposal_key)
             .ok_or(Error::ProposalNotFound)?;
 
         if proposal.executed {
             return Err(Error::ProposalAlreadyExecuted);
         }
 
-        let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
+        // Check expiry
+        let current_ledger = env.ledger().sequence();
+        if current_ledger
+            .checked_sub(proposal.created_at)
+            .map_or(true, |age| age > MULTISIG_PROPOSAL_EXPIRY)
+        {
+            return Err(Error::ProposalExpired);
+        }
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .ok_or(Error::NotInitialized)?;
         if proposal.approvals.len() < threshold {
             return Err(Error::ThresholdNotMet);
         }
@@ -5539,10 +5597,8 @@ impl FiatBridge {
         // Execute the action
         Self::execute_single_admin_op(&env, &proposal.action)?;
 
-        proposal.executed = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::MultisigProposal(id), &proposal);
+        // Delete the proposal after successful execution
+        env.storage().persistent().remove(&proposal_key);
 
         MultisigExecutedEvent {
             version: EVENT_VERSION,
@@ -5554,7 +5610,9 @@ impl FiatBridge {
     }
 
     pub fn get_multisig_proposal(env: Env, id: u64) -> Option<MultisigProposal> {
-        env.storage().instance().get(&DataKey::MultisigProposal(id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::MultisigProposal(id))
     }
 
     pub fn get_multisig_signers(env: Env) -> Vec<Address> {
