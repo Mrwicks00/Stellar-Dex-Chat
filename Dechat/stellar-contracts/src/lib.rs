@@ -17,6 +17,9 @@ const WINDOW_LEDGERS: u32 = 17_280; // ~24 hours
 const CIRCUIT_BREAKER_RESET_LEDGERS: u32 = 34_560; // ~48 hours (2 × WINDOW_LEDGERS)
 const WITHDRAWAL_EXPIRY_WINDOW_LEDGERS: u32 = 17_280; // ~24 hours — reserved for future withdrawal expiry feature
 const MIN_TIMELOCK_DELAY: u32 = 34_560; // 48 hours
+/// Maximum lock period to prevent overflow in unlock_ledger calculation.
+/// Set to 1 year of ledgers (~6.3M at ~5-6 seconds per ledger).
+const MAX_LOCK_PERIOD: u32 = 6_307_200;
 /// Number of ledgers a multisig proposal is valid before it expires.
 /// Stellar closes roughly 1 ledger every ~5–6 seconds (≈17 280 ledgers/day).
 /// At that rate 518 400 ledgers ≈ 30 days.
@@ -471,6 +474,14 @@ pub struct SetMinDepositEvent {
 
 #[contractevent]
 #[derive(Clone, Debug)]
+pub struct SetLockPeriodEvent {
+    pub version: u32,
+    pub old: u32,
+    pub new: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
 pub struct SetLimitEvent {
     pub version: u32,
     pub token: Address,
@@ -901,6 +912,7 @@ pub enum DataKey {
     MaxOperators,
     OperatorList,
     OperatorHeartbeat(Address),
+    OperatorActivatedAt(Address),
     OperatorNonce(Address),
     WithdrawOperator,
     Denied(Address),
@@ -950,6 +962,8 @@ pub enum DataKey {
     UpgradeCancellationNonce(Address),
     /// Per-admin replay-protection nonce for `set_limit`.
     SetLimitNonce(Address),
+    /// Per-admin replay-protection nonce for `set_operator`.
+    SetOperatorNonce(Address),
 }
 
 const ORACLE_PRICE_DECIMALS: i128 = 10_000_000;
@@ -1595,10 +1609,10 @@ impl FiatBridge {
     ///   [`i128::checked_add`], returning [`Error::Overflow`] on overflow.
     /// - **Saturating TTL Calculations**: Computes the receipt TTL extension using
     ///   [`u32::saturating_add`] on `MIN_TTL + lock_period + cooldown_ledgers`.
-    /// - **Plain Unlock/ID Arithmetic**: `unlock_ledger = sequence + lock_period` and the
-    ///   `NextRequestID` bump (`request_id + 1`) use plain `+`, not saturating or checked addition.
-    ///   The release profile sets `overflow-checks = true`, so an overflow traps and aborts the
-    ///   transaction instead of wrapping; it never returns [`Error::Overflow`].
+    /// - **Checked Unlock Ledger Arithmetic**: `unlock_ledger = sequence.checked_add(lock_period)`
+    ///   uses [`u32::checked_add`], returning [`Error::Overflow`] on overflow.
+    /// - **Checked ID Arithmetic**: The `NextRequestID` and `WithdrawQueueLen` bumps use
+    ///   [`u64::checked_add`], returning [`Error::Overflow`] on overflow.
     /// - **Cooldown Verification**: Verifies large deposit cooldown via saturating ledger sequence addition.
     ///
     /// # Arguments
@@ -1678,11 +1692,16 @@ impl FiatBridge {
             .get(&DataKey::WithdrawQueueLen)
             .unwrap_or(0);
 
+        let unlock_ledger = env
+            .ledger()
+            .sequence()
+            .checked_add(lock_period)
+            .ok_or(Error::Overflow)?;
         let request = WithdrawRequest {
             to: to.clone(),
             token: token.clone(),
             amount,
-            unlock_ledger: env.ledger().sequence() + lock_period,
+            unlock_ledger,
             memo_hash: memo_hash.clone(),
             queued_ledger: env.ledger().sequence(),
             risk_tier,
@@ -1690,18 +1709,20 @@ impl FiatBridge {
         env.storage()
             .persistent()
             .set(&DataKey::WithdrawQueue(request_id), &request);
+        let next_id = request_id.checked_add(1).ok_or(Error::Overflow)?;
         env.storage()
             .instance()
-            .set(&DataKey::NextRequestID, &(request_id + 1));
+            .set(&DataKey::NextRequestID, &next_id);
 
         if queue_len == 0 {
             env.storage()
                 .instance()
                 .set(&DataKey::WithdrawQueueHead, &Some(request_id));
         }
+        let new_queue_len = queue_len.checked_add(1).ok_or(Error::Overflow)?;
         env.storage()
             .instance()
-            .set(&DataKey::WithdrawQueueLen, &(queue_len + 1));
+            .set(&DataKey::WithdrawQueueLen, &new_queue_len);
 
         // ── Issue #226: per-tier queue tracking ──────────────────────────
         let tier_len: u64 = env
@@ -2368,9 +2389,32 @@ impl FiatBridge {
         Ok(())
     }
 
+    /// Set the withdrawal lock period in ledgers.
+    ///
+    /// The lock period must not exceed `MAX_LOCK_PERIOD` (1 year of ledgers)
+    /// to prevent overflow in the `unlock_ledger` calculation.
+    ///
+    /// # Errors
+    /// * [`Error::InvalidAmount`] – If `ledgers > MAX_LOCK_PERIOD`.
     pub fn set_lock_period(env: Env, ledgers: u32) -> Result<(), Error> {
         let _admin = Self::require_admin(&env)?;
+
+        if ledgers > MAX_LOCK_PERIOD {
+            return Err(Error::InvalidAmount);
+        }
+
+        let old_value: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LockPeriod)
+            .unwrap_or(0);
         env.storage().instance().set(&DataKey::LockPeriod, &ledgers);
+        SetLockPeriodEvent {
+            version: EVENT_VERSION,
+            old: old_value,
+            new: ledgers,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -2781,6 +2825,14 @@ impl FiatBridge {
         if env.ledger().sequence() <= action.target_ledger {
             return Err(Error::ActionNotReady);
         }
+
+        // Execute the action by dispatching on action_type
+        let op = BatchAdminOp {
+            op_type: action.action_type.clone(),
+            payload: action.payload.clone(),
+        };
+        Self::execute_single_admin_op(&env, &op)?;
+
         env.storage()
             .persistent()
             .remove(&DataKey::QueuedAdminAction(id));
@@ -2795,7 +2847,47 @@ impl FiatBridge {
         Ok(())
     }
 
+    pub fn cancel_admin_action(env: Env, id: u64) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env)?;
+        let action: QueuedAdminAction = env
+            .storage()
+            .persistent()
+            .get(&DataKey::QueuedAdminAction(id))
+            .ok_or(Error::ActionNotQueued)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::QueuedAdminAction(id));
+        AdminActionExecutedEvent {
+            version: EVENT_VERSION,
+            action_id: id,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn get_queued_admin_action(env: Env, id: u64) -> Option<QueuedAdminAction> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::QueuedAdminAction(id))
+    }
+
     // ── Operator Role & Heartbeat ───────────────────────────────────────
+    /// Set the active status of an operator address.
+    ///
+    /// The `nonce` parameter is a replay-protection nonce keyed on the admin
+    /// address (not the operator). Use `get_set_operator_nonce` to read the
+    /// current nonce for an admin.
+    ///
+    /// # Arguments
+    /// * `env` – The Soroban host environment.
+    /// * `operator` – The operator address to activate or deactivate.
+    /// * `active` – Whether the operator should be active.
+    /// * `nonce` – Admin-keyed replay-protection nonce.
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] – If the caller is not the admin.
+    /// * [`Error::InvalidNonce`] – If the provided nonce does not match the current admin nonce.
+    /// * [`Error::StaleNonce`] – If the provided nonce is lower than the current admin nonce.
     pub fn set_operator(
         env: Env,
         operator: Address,
@@ -2822,8 +2914,20 @@ impl FiatBridge {
             return Err(Error::InvalidRecipient);
         }
 
-        // Validate and increment nonce for replay protection
-        Self::validate_and_increment_nonce(&env, &operator, nonce)?;
+        // Validate and increment nonce for replay protection (admin-keyed)
+        let new_nonce = Self::consume_nonce(
+            &env,
+            DataKey::SetOperatorNonce(admin.clone()),
+            nonce,
+        )?;
+
+        NonceConsumedEvent {
+            version: EVENT_VERSION,
+            scope: Symbol::new(&env, "set_operator"),
+            owner: admin.clone(),
+            new_nonce,
+        }
+        .publish(&env);
 
         Self::prune_inactive_operators_internal(&env);
         let was_active = env
@@ -2831,6 +2935,13 @@ impl FiatBridge {
             .instance()
             .get::<_, bool>(&DataKey::Operator(operator.clone()))
             .unwrap_or(false);
+
+        // Record activation ledger when activating an operator
+        if active && !was_active {
+            env.storage()
+                .instance()
+                .set(&DataKey::OperatorActivatedAt(operator.clone()), &env.ledger().sequence());
+        }
 
         // Return NotOperator when attempting to deactivate a non-operator
         if !active && !was_active {
@@ -2929,6 +3040,29 @@ impl FiatBridge {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Set the inactivity threshold for operator pruning.
+    ///
+    /// Operators who have not sent a heartbeat or been activated within this
+    /// number of ledgers will be pruned by `prune_inactive_operators`.
+    pub fn set_inactivity_threshold(env: Env, threshold: u32) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::InactivityThreshold, &threshold);
+        Ok(())
+    }
+
+    /// Get the current set_operator nonce for an admin.
+    ///
+    /// This nonce is used for replay protection on `set_operator` calls and is
+    /// keyed on the admin address, separate from the operator's heartbeat nonce.
+    pub fn get_set_operator_nonce(env: Env, admin: Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SetOperatorNonce(admin))
+            .unwrap_or(0)
     }
 
     // ── Denylist ──────────────────────────────────────────────────────────
@@ -3203,6 +3337,7 @@ impl FiatBridge {
     /// - The threshold is configurable via `InactivityThreshold` storage key
     /// - Defaults to `DEFAULT_INACTIVITY_THRESHOLD` (~3 months)
     /// - Operators without any heartbeat record are considered inactive
+    /// - An operator is pruned when `current_ledger - max(last_heartbeat, activated_at) > threshold`
     ///
     /// # Security Properties
     /// - Prevents long-term operator key compromise from affecting operations
@@ -3236,9 +3371,27 @@ impl FiatBridge {
                 .storage()
                 .instance()
                 .get::<_, u32>(&DataKey::OperatorHeartbeat(operator.clone()));
-            let is_inactive = heartbeat
-                .map(|last| current_ledger.saturating_sub(last) > threshold)
-                .unwrap_or(false);
+            let activated_at = env
+                .storage()
+                .instance()
+                .get::<_, u32>(&DataKey::OperatorActivatedAt(operator.clone()));
+
+            // An operator is inactive if:
+            // - They have no heartbeat record, OR
+            // - The time since their last heartbeat exceeds the threshold
+            // - We use max(last_heartbeat, activated_at) to handle operators who never sent a heartbeat
+            let last_activity = match (heartbeat, activated_at) {
+                (Some(hb), Some(aa)) => hb.max(aa),
+                (Some(hb), None) => hb,
+                (None, Some(aa)) => aa,
+                (None, None) => 0, // Should not happen for active operators, but treat as inactive
+            };
+
+            let is_inactive = if last_activity == 0 {
+                true // No activity record - treat as inactive
+            } else {
+                current_ledger.saturating_sub(last_activity) > threshold
+            };
 
             if is_inactive {
                 env.storage()
@@ -4784,7 +4937,21 @@ impl FiatBridge {
             Ok(())
         } else if *op_name == Symbol::new(env, "set_lock") {
             let ledgers = Self::bytes_to_u32(env, &op.payload)?;
+            if ledgers > MAX_LOCK_PERIOD {
+                return Err(Error::InvalidAmount);
+            }
+            let old_value: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::LockPeriod)
+                .unwrap_or(0);
             env.storage().instance().set(&DataKey::LockPeriod, &ledgers);
+            SetLockPeriodEvent {
+                version: EVENT_VERSION,
+                old: old_value,
+                new: ledgers,
+            }
+            .publish(env);
             Ok(())
         } else if *op_name == Symbol::new(env, "set_quota") {
             let quota = Self::bytes_to_i128(env, &op.payload)?;
@@ -5891,6 +6058,18 @@ mod test_get_deploy_config_hash_invariants;
 
 #[cfg(test)]
 mod test_issue_1437;
+
+#[cfg(test)]
+mod test_issue_1388;
+
+#[cfg(test)]
+mod test_issue_1389;
+
+#[cfg(test)]
+mod test_issue_1387;
+
+#[cfg(test)]
+mod test_issue_1390;
 
 #[cfg(test)]
 mod test_migrate_escrow_invariants;
