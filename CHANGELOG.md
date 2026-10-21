@@ -917,9 +917,16 @@ Repo Avatar
 - **frontend:** Use theme-input-border on inputs in StellarFiatModal
 - **frontend:** Keep themed chart border colour on admin dashboard
 - **frontend:** Resolve UI stability and accessibility issues
+- **contract:** Prune_inactive_operators never prunes operators that have
+- **contract:** Execute_admin_action deletes the queued action without applying it
+- **contract:** Set_operator consumes the operator's heartbeat nonce
+- **contract:** Set_lock_period is unbounded, so request_withdrawal can panic on unlock_ledger overflow
 - **contracts:** Reject denied recipients in execute_withdrawal
 - **contract:** Improve validation and add loading states
 - **contract:** Edge case validation and fee withdrawal invariants
+- Use live operator list in set_max_operators boundary check
+- Remove duplicate env import in security.ts causing webpack build failure
+- Resolve 7 compile errors in stellar-contracts
 
 ### Changed
 
@@ -1243,6 +1250,7 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **contract:** Improve inline documentation for operator inactivity threshold
 - **contract:** Improve inline docs and add validation for set_operator_daily_limit
+- **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
@@ -1764,6 +1772,9 @@ entrypoint are dead weight in the ABI and WASM.
 - Merge pull request #1559 from anifast-123/fix/1552-remove-legacy-fee-withdrawal-nonce
 
 remove legacy FeeWithdrawalNonce key and migrate_fee_withdrawal_nonce…
+- Refactor multisig action approval tests
+
+Removed assertions related to executed proposals and added a new test for uninitialized state.
 
 ### Security
 
