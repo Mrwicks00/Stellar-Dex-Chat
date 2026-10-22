@@ -1189,6 +1189,8 @@ impl FiatBridge {
     /// * `reference` – Client payment reference (length $\le 64$).
     /// * `expected_price` – Expected benchmark oracle price scaled by `FIXED_POINT` (0 to skip slippage check).
     /// * `max_slippage` – Maximum allowed downward price slippage in basis points (BPS).
+    ///   Clamped to the admin [`SlippageThreshold`](DataKey::SlippageThreshold) when that is
+    ///   non-zero, so passing a larger value cannot loosen the admin policy.
     /// * `memo_hash` – Optional 32-byte hash identifying the deposit batch/memo.
     ///
     /// # Returns
@@ -1202,7 +1204,8 @@ impl FiatBridge {
     /// * [`Error::TokenNotWhitelisted`] – If token is not registered.
     /// * [`Error::ExceedsLimit`] – If `amount` exceeds per-transaction limit.
     /// * [`Error::ExceedsFiatLimit`] – If `amount` exceeds 24-hour fiat volume cap.
-    /// * [`Error::SlippageTooHigh`] – If execution price deviates downward beyond `max_slippage`.
+    /// * [`Error::SlippageTooHigh`] – If execution price deviates downward beyond
+    ///   `min(max_slippage, SlippageThreshold)` (or `max_slippage` when no threshold is set).
     /// * [`Error::Overflow`] – If vault deposit accumulator overflows `i128`.
     pub fn deposit(
         env: Env,
@@ -1791,6 +1794,8 @@ impl FiatBridge {
     /// * `partial_amount` – Optional sub-amount to partially execute (if `None`, executes full remaining amount).
     /// * `expected_price` – Expected benchmark oracle price scaled by `FIXED_POINT` (0 to skip slippage check).
     /// * `max_slippage` – Maximum allowed downward price slippage in basis points.
+    ///   Clamped to the admin [`SlippageThreshold`](DataKey::SlippageThreshold) when that is
+    ///   non-zero, so passing a larger value cannot loosen the admin policy.
     /// * `nonce` – Replay protection nonce corresponding to recipient address.
     ///
     /// # Errors
@@ -1802,7 +1807,8 @@ impl FiatBridge {
     /// * [`Error::WithdrawalLocked`] – If request is still within timelock.
     /// * [`Error::AntiSandwichDelayActive`] – If executed before anti-sandwich delay expires.
     /// * [`Error::InsufficientFunds`] – If contract balance is insufficient.
-    /// * [`Error::SlippageTooHigh`] – If actual oracle price exceeds max slippage threshold.
+    /// * [`Error::SlippageTooHigh`] – If the oracle price deviates downward beyond
+    ///   `min(max_slippage, SlippageThreshold)` (or `max_slippage` when no threshold is set).
     /// * [`Error::InternalError`] – If `total_withdrawn` overflows `i128`.
     pub fn execute_withdrawal(
         env: Env,
@@ -2564,10 +2570,15 @@ impl FiatBridge {
     /// * `env` – The Soroban host environment.
     /// * `expected_price` – Expected benchmark oracle price scaled by `FIXED_POINT` (0 to skip check).
     /// * `actual_price` – Realized oracle price scaled by `FIXED_POINT`.
-    /// * `max_slippage_bps` – Maximum allowable downward slippage in basis points (1 BPS = 0.01%).
+    /// * `max_slippage_bps` – Caller-requested maximum downward slippage in basis points
+    ///   (1 BPS = 0.01%). When the admin has set a non-zero
+    ///   [`SlippageThreshold`](DataKey::SlippageThreshold), this is clamped to
+    ///   `min(max_slippage_bps, threshold)`, so a caller can tighten but never
+    ///   loosen the admin policy (Issue #1402).
     ///
     /// # Errors
-    /// * [`Error::SlippageTooHigh`] – If downward price slippage exceeds `max_slippage_bps`.
+    /// * [`Error::SlippageTooHigh`] – If downward price slippage exceeds the effective
+    ///   (clamped) tolerance.
     fn check_slippage(
         env: &Env,
         expected_price: i128,
@@ -2577,6 +2588,18 @@ impl FiatBridge {
         if expected_price <= 0 {
             return Ok(()); // Skip if no benchmark provided
         }
+
+        // Issue #1402: the admin threshold caps the caller-supplied tolerance.
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SlippageThreshold)
+            .unwrap_or(0);
+        let max_slippage_bps = if threshold > 0 {
+            max_slippage_bps.min(threshold)
+        } else {
+            max_slippage_bps
+        };
 
         // Computed slippage in BPS: (Expected - Actual) / Expected * 10,000
         // We only care about downward slippage for these paths.
@@ -2880,15 +2903,6 @@ impl FiatBridge {
         nonce: u64,
     ) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
-
-        let current_slippage_threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SlippageThreshold)
-            .unwrap_or(0);
-        if current_slippage_threshold > 10000 {
-            return Err(Error::SlippageTooHigh);
-        }
 
         // Reject admin as operator (role confusion guard)
         if operator == admin {
@@ -4086,14 +4100,17 @@ impl FiatBridge {
             .unwrap_or(0)
     }
 
-    /// Set the slippage threshold for batch operations.
+    /// Set the protocol-wide maximum slippage, in basis points (BPS).
     ///
-    /// This function sets the maximum allowed slippage in basis points (BPS).
-    /// 1 BPS = 0.01%, so 10000 BPS = 100%.
+    /// 1 BPS = 0.01%, so 10000 BPS = 100%. When non-zero, [`deposit`](FiatBridge::deposit)
+    /// and [`execute_withdrawal`](FiatBridge::execute_withdrawal) clamp the caller-supplied
+    /// `max_slippage` to this value, so a caller can only tighten the admin policy, never
+    /// loosen it. `0` disables the cap and the caller's `max_slippage` is used as-is.
+    /// The same value can also be set through the `set_slippage_threshold` batch op.
     ///
     /// # Parameters
     ///
-    /// - `threshold_bps` – the slippage threshold in basis points (0-10000)
+    /// - `threshold_bps` – the slippage threshold in basis points (0-10000; 0 = no cap)
     ///
     /// # Errors
     ///
