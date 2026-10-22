@@ -92,8 +92,8 @@ pub enum Error {
     // --- 500 series: Withdrawal Queue ---
     RequestNotFound = 501,
     WithdrawalLocked = 502,
-    /// Deprecated: no contract path returns this error.
-    #[deprecated(note = "unused error code; do not use")]
+    /// Returned by [`FiatBridge::withdraw`] when the withdraw operator's rolling
+    /// 24h volume would exceed its [`FiatBridge::set_operator_daily_limit`] cap.
     OperatorDailyLimitExceeded = 503,
 
     // --- 600 series: Governance & Timelock ---
@@ -480,6 +480,14 @@ pub struct SetLockPeriodEvent {
     pub version: u32,
     pub old: u32,
     pub new: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct OperatorDailyLimitSetEvent {
+    pub version: u32,
+    pub operator: Address,
+    pub limit: i128,
 }
 
 #[contractevent]
@@ -952,6 +960,9 @@ pub enum DataKey {
     // ── Missing: limit max cap, operator daily limit, emergency recovery cap, fee withdrawal nonce
     LimitMaxCap,
     OperatorDailyLimit(Address),
+    /// Rolling 24h `withdraw` volume of an operator (temporary storage),
+    /// checked against `OperatorDailyLimit` (Issue #1403).
+    OperatorDailyVolume(Address),
     EmergencyRecoveryCap,
     FeeWithdrawalNonceByCaller(Address),
     // ── Issue #1113: per-caller replay protection for batch fee withdrawals ──
@@ -1508,6 +1519,10 @@ impl FiatBridge {
     /// # Errors
     /// * [`Error::Unauthorized`] – If `caller` is not admin or active withdraw operator.
     /// * [`Error::ZeroAmount`] – If `amount <= 0`.
+    /// * [`Error::OperatorDailyLimitExceeded`] – If `caller` is the withdraw operator and
+    ///   `amount` would push its rolling 24h volume above its
+    ///   [`set_operator_daily_limit`](FiatBridge::set_operator_daily_limit) cap. The admin is
+    ///   not subject to this cap.
     /// * [`Error::InvalidRecipient`] – If `to == env.current_contract_address()`.
     /// * [`Error::AddressDenied`] – If recipient is on the denylist.
     /// * [`Error::InsufficientFunds`] – If contract holds fewer tokens than `amount`.
@@ -1529,22 +1544,21 @@ impl FiatBridge {
 
         let operator: Option<Address> = env.storage().instance().get(&DataKey::WithdrawOperator);
 
-        if caller == admin {
-            caller.require_auth();
-        } else if let Some(op) = operator {
-            if caller == op {
-                caller.require_auth();
-            } else {
-                return Err(Error::Unauthorized);
-            }
-        } else {
+        let is_admin = caller == admin;
+        if !is_admin && operator.as_ref() != Some(&caller) {
             return Err(Error::Unauthorized);
         }
+        caller.require_auth();
 
         Self::require_not_paused(&env)?;
 
         if amount <= 0 {
             return Err(Error::ZeroAmount);
+        }
+
+        // Issue #1403: per-operator rolling 24h volume cap (admin is exempt).
+        if !is_admin {
+            Self::enforce_operator_daily_limit(&env, &caller, amount)?;
         }
 
         // ── Issue #109: prevent tokens from being locked inside the contract ──
@@ -2759,6 +2773,51 @@ impl FiatBridge {
 
         record.amount += amount;
         env.storage().instance().set(&key, &record);
+        Ok(())
+    }
+
+    /// Adds `amount` to `operator`'s rolling 24h `withdraw` volume, failing with
+    /// [`Error::OperatorDailyLimitExceeded`] if that would exceed the configured
+    /// limit. A missing or zero limit disables the check. The volume lives in
+    /// temporary storage, so it simply expires once the window is over.
+    fn enforce_operator_daily_limit(
+        env: &Env,
+        operator: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OperatorDailyLimit(operator.clone()))
+            .unwrap_or(0);
+        if limit <= 0 {
+            return Ok(());
+        }
+
+        let curr = env.ledger().sequence();
+        let key = DataKey::OperatorDailyVolume(operator.clone());
+        let mut vol: GlobalDailyWithdrawn =
+            env.storage()
+                .temporary()
+                .get(&key)
+                .unwrap_or(GlobalDailyWithdrawn {
+                    amount: 0,
+                    window_start: curr,
+                });
+        if curr >= vol.window_start.saturating_add(WINDOW_LEDGERS) {
+            vol.amount = 0;
+            vol.window_start = curr;
+        }
+
+        let new_total = vol.amount.checked_add(amount).ok_or(Error::Overflow)?;
+        if new_total > limit {
+            return Err(Error::OperatorDailyLimitExceeded);
+        }
+        vol.amount = new_total;
+        env.storage().temporary().set(&key, &vol);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, WINDOW_LEDGERS, WINDOW_LEDGERS);
         Ok(())
     }
 
@@ -5836,26 +5895,32 @@ impl FiatBridge {
             .unwrap_or(i128::MAX)
     }
 
-    /// Set a per-operator daily withdrawal limit.
+    /// Set a per-operator rolling 24h withdrawal limit.
     ///
-    /// `limit` is denominated in the token's smallest unit (stroops for XLM).
-    /// It must be strictly positive — zero or negative values are rejected with
-    /// [`Error::ZeroAmount`] because a non-positive cap would either silently
-    /// block all withdrawals (0) or wrap around on comparison (negative).
+    /// `limit` is denominated in the token's smallest unit (stroops for XLM)
+    /// and is stored per `operator` under [`DataKey::OperatorDailyLimit`].
+    /// `0` disables the limit; negative values are rejected with
+    /// [`Error::InvalidAmount`]. Emits [`OperatorDailyLimitSetEvent`].
     ///
-    /// The limit applies per UTC calendar day and is tracked independently for
-    /// each `operator` address in instance storage under
-    /// [`DataKey::OperatorDailyLimit`].  Calls to `withdraw` accumulate against
-    /// this cap; once reached, further withdrawals by that operator fail with
-    /// [`Error::OperatorDailyLimitExceeded`] until the day rolls over.
+    /// Each [`withdraw`](FiatBridge::withdraw) made by the operator adds to a
+    /// volume counter that resets `WINDOW_LEDGERS` (~24h) after the first
+    /// withdrawal of the window. A withdrawal that would push the counter
+    /// above `limit` fails with [`Error::OperatorDailyLimitExceeded`];
+    /// reaching the limit exactly is allowed. The admin is not subject to it.
     pub fn set_operator_daily_limit(env: Env, operator: Address, limit: i128) -> Result<(), Error> {
         let _admin = Self::require_admin(&env)?;
-        if limit <= 0 {
-            return Err(Error::ZeroAmount);
+        if limit < 0 {
+            return Err(Error::InvalidAmount);
         }
         env.storage()
             .instance()
-            .set(&DataKey::OperatorDailyLimit(operator), &limit);
+            .set(&DataKey::OperatorDailyLimit(operator.clone()), &limit);
+        OperatorDailyLimitSetEvent {
+            version: EVENT_VERSION,
+            operator,
+            limit,
+        }
+        .publish(&env);
         Ok(())
     }
 
