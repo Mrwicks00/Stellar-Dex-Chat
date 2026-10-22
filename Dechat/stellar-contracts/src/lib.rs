@@ -36,6 +36,9 @@ const DEFAULT_INACTIVITY_THRESHOLD: u32 = 1_555_200; // ~3 months (≈17 280 led
 const MIN_UPGRADE_DELAY: u32 = 1_000;
 pub const EVENT_VERSION: u32 = 1;
 pub const ESCROW_STORAGE_VERSION: u32 = 1;
+/// Schema version of [`ConfigSnapshot`]. v2 removed `allowlist_enabled`
+/// (Issue #1401).
+pub const CONFIG_SNAPSHOT_VERSION: u32 = 2;
 
 // ── Error codes ───────────────────────────────────────────────────────────
 #[contracterror]
@@ -335,7 +338,6 @@ pub struct ConfigSnapshot {
     pub lock_period: u32,
     pub cooldown_ledgers: u32,
     pub inactivity_threshold: u32,
-    pub allowlist_enabled: bool,
     pub emergency_recovery: Option<Address>,
     pub anti_sandwich_delay: u32,
     pub paused: bool,
@@ -845,8 +847,6 @@ pub enum DataKey {
     Paused,
     Token, // Default token
     TokenRegistry(Address),
-    AllowlistEnabled,
-    Allowed(Address),
     LastDeposit(Address),
     ReceiptCounter,
     Receipt(BytesN<32>),
@@ -1255,36 +1255,21 @@ impl FiatBridge {
             .temporary()
             .extend_ttl(&key, max_delay, max_delay + 100);
 
-        // Allowlist
-        let global_allowlist_on: bool = env
+        // Per-token allowlist (Issue #354). This is the only allowlist: the
+        // former global `AllowlistEnabled`/`Allowed` keys had no setter and
+        // were removed (Issue #1401).
+        let token_allowlist_on: bool = env
             .storage()
             .instance()
-            .get(&DataKey::AllowlistEnabled)
+            .get(&DataKey::TokenAllowlistEnabled(token.clone()))
             .unwrap_or(false);
-
-        if global_allowlist_on {
-            if !env
+        if token_allowlist_on
+            && !env
                 .storage()
                 .persistent()
-                .has(&DataKey::Allowed(from.clone()))
-            {
-                return Err(Error::NotAllowed);
-            }
-        } else {
-            // Per-token allowlist check (Issue #354)
-            let token_allowlist_on: bool = env
-                .storage()
-                .instance()
-                .get(&DataKey::TokenAllowlistEnabled(token.clone()))
-                .unwrap_or(false);
-            if token_allowlist_on
-                && !env
-                    .storage()
-                    .persistent()
-                    .has(&DataKey::TokenAllowed(token.clone(), from.clone()))
-            {
-                return Err(Error::NotAllowed);
-            }
+                .has(&DataKey::TokenAllowed(token.clone(), from.clone()))
+        {
+            return Err(Error::NotAllowed);
         }
 
         // Denylist
@@ -4303,7 +4288,7 @@ impl FiatBridge {
             .ok_or(Error::NotInitialized)?;
 
         Ok(ConfigSnapshot {
-            version: EVENT_VERSION,
+            version: CONFIG_SNAPSHOT_VERSION,
             admin,
             pending_admin: env.storage().instance().get(&DataKey::PendingAdmin),
             token,
@@ -4324,11 +4309,6 @@ impl FiatBridge {
                 .instance()
                 .get(&DataKey::InactivityThreshold)
                 .unwrap_or(DEFAULT_INACTIVITY_THRESHOLD),
-            allowlist_enabled: env
-                .storage()
-                .instance()
-                .get(&DataKey::AllowlistEnabled)
-                .unwrap_or(false),
             emergency_recovery: env
                 .storage()
                 .instance()
