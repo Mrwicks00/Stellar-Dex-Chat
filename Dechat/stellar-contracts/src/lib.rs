@@ -84,6 +84,9 @@ pub enum Error {
     InvalidAmount = 317,
     SelfReferentialAddress = 318,
     LimitCapCannotBeLowered = 319,
+    /// Returned by [`FiatBridge::register_token`] when the token already has a
+    /// registry entry (including the primary token registered by `init`).
+    TokenAlreadyRegistered = 320,
 
     // --- 400 series: Funds & Balances ---
     InsufficientFunds = 401,
@@ -480,6 +483,15 @@ pub struct SetLockPeriodEvent {
     pub version: u32,
     pub old: u32,
     pub new: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TokenRegisteredEvent {
+    pub version: u32,
+    pub token: Address,
+    pub limit: i128,
+    pub daily_limit: i128,
 }
 
 #[contractevent]
@@ -2190,6 +2202,89 @@ impl FiatBridge {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Registers an additional token so it can be deposited, queued for
+    /// withdrawal and swept for fees alongside the primary token (Issue #1400).
+    ///
+    /// The new token gets its own [`TokenConfig`] with zeroed accounting, so its
+    /// totals are isolated from every other token. Once registered, the token is
+    /// protected from [`rescue_token`](FiatBridge::rescue_token). Its limits can
+    /// later be changed with [`set_limit`](FiatBridge::set_limit) and
+    /// [`set_daily_deposit_limit`](FiatBridge::set_daily_deposit_limit).
+    ///
+    /// # Arguments
+    /// * `token` – Token contract address to register.
+    /// * `limit` – Per-deposit limit in the token's smallest unit (must be $> 0$ and
+    ///   $\le$ the configured limit max cap).
+    /// * `daily_limit` – Per-user rolling 24h deposit limit (`0` disables it; must be
+    ///   $\ge 0$ and $\le$ `limit`).
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`] / [`Error::Unauthorized`] – If the caller is not the admin.
+    /// * [`Error::ZeroAmount`] – If `limit <= 0`.
+    /// * [`Error::ExceedsLimitMaxCap`] – If `limit` exceeds the configured limit max cap.
+    /// * [`Error::InvalidAmount`] – If `daily_limit < 0`.
+    /// * [`Error::ExceedsLimit`] – If `daily_limit > limit`.
+    /// * [`Error::SelfReferentialAddress`] – If `token` is the contract's own address.
+    /// * [`Error::TokenAlreadyRegistered`] – If `token` already has a registry entry.
+    pub fn register_token(
+        env: Env,
+        token: Address,
+        limit: i128,
+        daily_limit: i128,
+    ) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env)?;
+        if limit <= 0 {
+            return Err(Error::ZeroAmount);
+        }
+        let max_cap: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LimitMaxCap)
+            .unwrap_or(i128::MAX);
+        if limit > max_cap {
+            return Err(Error::ExceedsLimitMaxCap);
+        }
+        if daily_limit < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if daily_limit > limit {
+            return Err(Error::ExceedsLimit);
+        }
+        if token == env.current_contract_address() {
+            return Err(Error::SelfReferentialAddress);
+        }
+        let key = DataKey::TokenRegistry(token.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::TokenAlreadyRegistered);
+        }
+        env.storage().persistent().set(
+            &key,
+            &TokenConfig {
+                limit,
+                daily_deposit_limit: daily_limit,
+                total_deposited: 0,
+                total_withdrawn: 0,
+                total_liabilities: 0,
+            },
+        );
+        TokenRegisteredEvent {
+            version: EVENT_VERSION,
+            token,
+            limit,
+            daily_limit,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the registry entry (limits and accounting totals) for `token`,
+    /// or `None` if the token is not registered.
+    pub fn get_token_config(env: Env, token: Address) -> Option<TokenConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TokenRegistry(token))
     }
 
     pub fn set_token_allowlist_enabled(
@@ -6166,3 +6261,6 @@ mod test_denylist_invariants;
 
 #[cfg(test)]
 mod test_token_allowlist_invariants;
+
+#[cfg(test)]
+mod test_issues_1400_1403;
